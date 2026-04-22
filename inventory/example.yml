@@ -1,0 +1,52 @@
+---
+# Example Ansible inventory for torpor's linux-weekly-update.yml.
+#
+# Copy this to your private inventory, replace the placeholder values with
+# real hosts, and point `ansible-playbook -i <path>` at it.
+#
+# Two groups are required by the default playbook:
+#   - pve01 (or override via -e torpor_pve_group=...): the Proxmox host(s)
+#     where the VMs live, reachable as root over SSH.
+#   - linux_test_vms (or override via -e torpor_vm_group=...): the test VMs
+#     themselves. Each host needs ansible_host, vm_id, and ansible_user.
+
+all:
+  children:
+    pve01:
+      hosts:
+        my-pve-host:
+          ansible_host: pve01.example.net
+          ansible_user: root
+          # ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+
+    linux_test_vms:
+      vars:
+        ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+      children:
+        # Group per distro family — lets you target subsets with --limit.
+        rocky_test_vms:
+          vars:
+            ansible_user: rocky
+            vendor: rocky
+          hosts:
+            rocky-9:
+              ansible_host: 192.168.1.210
+              vm_id: 210
+
+        oracle_test_vms:
+          vars:
+            ansible_user: oracle
+            vendor: oracle
+          hosts:
+            oracle-9:
+              ansible_host: 192.168.1.214
+              vm_id: 214
+
+        ubuntu_test_vms:
+          vars:
+            ansible_user: ubuntu
+            vendor: canonical
+          hosts:
+            ubuntu-24:
+              ansible_host: 192.168.1.220
+              vm_id: 220

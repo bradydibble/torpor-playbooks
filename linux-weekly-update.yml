@@ -1,0 +1,182 @@
+---
+# Weekly update cycle for the torpor test-VM fleet.
+#
+# Three plays:
+#   1. Start every VM in `torpor_vm_group` via `qm start` on the Proxmox host.
+#   2. Per VM: update all packages (distro-aware), reboot if a new kernel
+#      landed, and emit a JSON report.
+#   3. Graceful shutdown of every VM.
+#
+# Override the group names with -e if your inventory uses different ones:
+#   ansible-playbook linux-weekly-update.yml \
+#     -e torpor_pve_group=pve01 -e torpor_vm_group=linux_test_vms
+#
+# Expected inventory vars per VM:
+#   - ansible_host    (IP or DNS name)
+#   - vm_id           (Proxmox VMID)
+#   - ansible_user    (cloud-init user created by torpor provision)
+
+- name: Start test VMs
+  hosts: "{{ torpor_pve_group | default('pve01') }}"
+  gather_facts: false
+  vars:
+    _group: "{{ torpor_vm_group | default('linux_test_vms') }}"
+  tasks:
+    - name: Ensure each VM is running
+      ansible.builtin.command: "qm start {{ item.vm_id }}"
+      loop: "{{ groups[_group] | map('extract', hostvars) | list }}"
+      failed_when: false
+      register: start_results
+      changed_when: "'already running' not in (start_results.stderr | default(''))"
+
+    - name: Wait for SSH on each VM
+      ansible.builtin.wait_for:
+        host: "{{ item.ansible_host }}"
+        port: 22
+        delay: 5
+        timeout: 300
+      loop: "{{ groups[_group] | map('extract', hostvars) | list }}"
+      delegate_to: localhost
+
+- name: Update test VMs
+  hosts: "{{ torpor_vm_group | default('linux_test_vms') }}"
+  gather_facts: true
+  serial: 1
+  become: true
+
+  tasks:
+    - name: Record pre-state
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "hostname: $(hostname)"
+        echo "kernel:   $(uname -r)"
+        echo "distro:   {{ ansible_facts.distribution | default('unknown') }} {{ ansible_facts.distribution_version | default('') }}"
+        echo "cpe:      $(cat /etc/system-release-cpe 2>/dev/null || echo unknown)"
+      args:
+        executable: /bin/bash
+      register: pre_state
+      changed_when: false
+
+    - name: Count packages (RedHat/Suse)
+      ansible.builtin.shell: "rpm -qa | wc -l"
+      register: pre_pkg_rpm
+      changed_when: false
+      when: ansible_facts.os_family in ['RedHat', 'Suse']
+
+    - name: Count packages (Debian)
+      ansible.builtin.shell: "dpkg -l | grep -c '^ii'"
+      register: pre_pkg_deb
+      changed_when: false
+      when: ansible_facts.os_family == 'Debian'
+
+    - name: Update all packages (dnf)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+      register: pkg_result_dnf
+      when: ansible_facts.pkg_mgr == 'dnf'
+
+    - name: Update all packages (yum)
+      ansible.builtin.yum:
+        name: "*"
+        state: latest
+      register: pkg_result_yum
+      when: ansible_facts.pkg_mgr == 'yum'
+
+    - name: Update all packages (apt)
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+      register: pkg_result_apt
+      when: ansible_facts.pkg_mgr == 'apt'
+
+    - name: Update all packages (zypper)
+      community.general.zypper:
+        name: "*"
+        state: latest
+      register: pkg_result_zypper
+      when: ansible_facts.pkg_mgr == 'zypper'
+
+    - name: Check if reboot needed (RedHat)
+      ansible.builtin.command: needs-restarting -r
+      register: reboot_rh
+      failed_when: false
+      changed_when: false
+      when: ansible_facts.os_family == 'RedHat'
+
+    - name: Check if reboot needed (Debian)
+      ansible.builtin.stat:
+        path: /run/reboot-required
+      register: reboot_deb
+      when: ansible_facts.os_family == 'Debian'
+
+    - name: Check if reboot needed (Suse)
+      ansible.builtin.command: zypper ps -s
+      register: reboot_suse
+      failed_when: false
+      changed_when: false
+      when: ansible_facts.os_family == 'Suse'
+
+    - name: Decide reboot
+      ansible.builtin.set_fact:
+        need_reboot: >-
+          {{
+            (ansible_facts.os_family == 'RedHat' and (reboot_rh.rc | default(0)) == 1)
+            or
+            (ansible_facts.os_family == 'Debian' and (reboot_deb.stat.exists | default(false)))
+            or
+            (ansible_facts.os_family == 'Suse' and ((reboot_suse.stdout | default('')) | length > 0))
+          }}
+
+    - name: Reboot if required
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      when: need_reboot | bool
+
+    - name: Record post-state
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "hostname: $(hostname)"
+        echo "kernel:   $(uname -r)"
+        echo "distro:   {{ ansible_facts.distribution | default('unknown') }} {{ ansible_facts.distribution_version | default('') }}"
+        echo "cpe:      $(cat /etc/system-release-cpe 2>/dev/null || echo unknown)"
+      args:
+        executable: /bin/bash
+      register: post_state
+      changed_when: false
+
+    - name: Assemble per-host report
+      ansible.builtin.set_fact:
+        torpor_report:
+          host: "{{ inventory_hostname }}"
+          vendor: "{{ vendor | default('unknown') }}"
+          product: "{{ product | default('n/a') }}"
+          os_family: "{{ ansible_facts.os_family }}"
+          pkg_mgr: "{{ ansible_facts.pkg_mgr }}"
+          pre: "{{ pre_state.stdout }}"
+          post: "{{ post_state.stdout }}"
+          rebooted: "{{ need_reboot | bool }}"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Emit JSON artifact
+      ansible.builtin.copy:
+        content: "{{ torpor_report | to_nice_json }}"
+        dest: "/tmp/torpor-weekly-{{ inventory_hostname }}-{{ ansible_date_time.epoch }}.json"
+      delegate_to: localhost
+      become: false
+
+    - name: Show summary
+      ansible.builtin.debug:
+        var: torpor_report
+
+- name: Shut down test VMs
+  hosts: "{{ torpor_pve_group | default('pve01') }}"
+  gather_facts: false
+  vars:
+    _group: "{{ torpor_vm_group | default('linux_test_vms') }}"
+  tasks:
+    - name: Graceful shutdown each VM
+      ansible.builtin.command: "qm shutdown {{ item.vm_id }} --timeout 60"
+      loop: "{{ groups[_group] | map('extract', hostvars) | list }}"
+      failed_when: false
+      changed_when: true
