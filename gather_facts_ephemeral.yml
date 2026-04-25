@@ -27,4 +27,6 @@
       ansible.builtin.command: shutdown -h +1
       become: true
       ignore_errors: true
-      when: ansible_os_family != 'Windows'
+      when:
+        - ansible_os_family != 'Windows'
+        - group_names | intersect(['linux_test_vms', 'game_servers']) | length > 0
